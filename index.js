@@ -1,9 +1,10 @@
-import { db } from "./db";
-import { todosTable } from "./db/schema";
+import { db } from "./db/index.js";
+import { todosTable } from "./db/schema.js";
 import { eq, ilike } from "drizzle-orm";
 import readlineSync from "readline-sync";
-// import { GoogleGenerativeAI } from "@google/generative-ai";
-// const genAI = new GoogleGenerativeAI("GEMINI_API_KEY");
+import { GoogleGenerativeAI } from "@google/generative-ai";
+
+const genAI = new GoogleGenerativeAI("GEMINI_API_KEY");
 
 async function getAllTodos() {
   const todos = await db.select().from(todosTable);
@@ -35,84 +36,135 @@ async function searchTodo(search) {
 }
 
 const tools = {
-  getAllTodos: getAllTodos,
-  createTodo: createTodo,
+  getAllTodos,
+  createTodo,
   deleteById,
-  deleteById,
-  searchTodo,
   searchTodo,
 };
 
 const SYSTEM_PROMPT = `
-You are an AI TO-Do List Assistant with START, PLAN, ACTION, Observation and Output State.
-wait for the user prompt and first PLAN using available tools.
-After Planning, Take the action with appropriate tools and wait for Observation based on Action.
-Once you get the observation, Return the AI response based on START prompt and observations 
+You are an AI Todo Assistant. For any task-related request, you MUST create an action to add it to the database.
+DO NOT just respond with output - you must use the createTodo action.
 
-You can manage tasks by adding, viewing, updating and deleting
-You must strictly follow the JSON output formate.
+Respond ONLY with JSON in these formats:
 
-Todo DB Schema:
-id: Int and Primary Key 
-todo: String
-created_at: Date Time
-updated_at: Date Time
+For new todos:
+{"type": "action", "function": "createTodo", "input": "the todo text"}
 
-Available Tools:
-- getAllTodos(): Returns all the todos from the Databse
-- createTodo(todo: string): Creates a new Todo in the DB and takes todo as a string and returns the ID of created todo
-- deleteById(id: string): Deletes the todo by ID given in the DB
-- searchTodo(query: string): Searches for all todos matching the query string using ilike operator
+For viewing todos:
+{"type": "action", "function": "getAllTodos"}
 
-Example:
-{"type": "user", "user" : "Add a task for shopping groceries."}
-{"type": "plan", "plan" : "I will try to get more context on what user needs to shop."}
-{"type": "output", "output" : "Can you tell me what all items you want to shop for? ."}
-{"type": "user", "user" : "I want ot shop for Milk, Kurkure, layes and Choco."}
-{"type": "plan", "plan" : "I will use createTodo to create a new Todo in DB."}
-{"type": "action", "function" : "createTodo", "input": "shopping for milk, kurkure, layes and Choco."}
-{"type": "observation", "observation" : "2"}
-{"type": "output", "output" : "Your todo has been added succesfully"}
+For searching:
+{"type": "action", "function": "searchTodo", "input": "search term"}
+
+For deleting:
+{"type": "action", "function": "deleteById", "input": "id"}
+
+After actions, you'll get an observation with the result.
+Then respond with:
+{"type": "output", "output": "your message"}
+
+For greetings/unclear requests, respond with:
+{"type": "output", "output": "your helpful message asking what todo they want to add"}
+
+Example interaction:
+User: "Add a task to buy groceries"
+Assistant: {"type": "action", "function": "createTodo", "input": "buy groceries"}
+System: {"type": "observation", "observation": 1}
+Assistant: {"type": "output", "output": "I've added 'buy groceries' to your todo list!"}
+
+IMPORTANT: Always use createTodo for any task the user mentions. Return only JSON, no extra text.
 `;
 
-const messages = [{ role: "system", content: SYSTEM_PROMPT }];
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-while (true) {
-  const query = readlineSync.question(">> ");
-  const userMessage = {
-    type: "user",
-    user: query,
-  };
-  messages.push({ role: "user", content: JSON.stringify(userMessage) });
-
-  while (true) {
-    const chat = await client.chat.completions.create({
-      model: "gpt-4o",
-      messages: messages,
-      response_formate: { type: "json_object" },
+function cleanResponse(response) {
+  let cleaned = response.replace(/```json\n/g, '')
+                       .replace(/```\n/g, '')
+                       .replace(/```/g, '')
+                       .trim();
+  
+  if (!cleaned.startsWith('{')) {
+    return JSON.stringify({
+      type: "output",
+      output: "I apologize, but I couldn't process that request. Could you please try again?"
     });
-    const result = chat.choices[0].message.content;
-    messages.push({ role: "assistant", content: result });
+  }
+  
+  return cleaned;
+}
 
-    const action = JSON.parse(result);
-
-    if (action.type == "output") {
-      console.log(`🤖: ${action.output}`);
-      break;
-    } else if (action.type == "action") {
-      const fn = tools[action.function];
-      if (!fn) throw new Error("Invalid tool call");
-
-      const observation = await fn(action.input);
-      const observationMessage = {
-        type: "observation",
-        observation: observation,
-      };
-      messages.push({
-        role: "developer",
-        content: JSON.stringify(observationMessage),
-      });
-    }
+async function generateResponse(prompt) {
+  try {
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    return cleanResponse(response.text());
+  } catch (error) {
+    console.error("Error generating response:", error);
+    throw error;
   }
 }
+
+async function processMessage(userMessage) {
+  try {
+    const messageContent = JSON.stringify({ type: "user", user: userMessage });
+    const content = await generateResponse(`${SYSTEM_PROMPT}\nUser Input: ${messageContent}\nResponse:`);
+    
+    try {
+      const action = JSON.parse(content);
+      
+      if (action.type === "action") {
+        const fn = tools[action.function];
+        if (!fn) {
+          console.error("Invalid function call:", action.function);
+          return true;
+        }
+
+        console.log(`Executing ${action.function} with input:`, action.input);
+        const observation = await fn(action.input);
+        
+        const observationContent = JSON.stringify({
+          type: "observation",
+          observation: observation,
+        });
+        
+        const nextResponse = await generateResponse(`${SYSTEM_PROMPT}\nObservation: ${observationContent}\nResponse:`);
+        const nextAction = JSON.parse(nextResponse);
+        
+        if (nextAction.type === "output") {
+          console.log(`🤖: ${nextAction.output}`);
+        }
+        return true;
+      } else if (action.type === "output") {
+        console.log(`🤖: ${action.output}`);
+        return true;
+      }
+      
+      return true;
+    } catch (e) {
+      console.error("Error processing response:", e);
+      console.log("Raw content:", content);
+      return true;
+    }
+  } catch (e) {
+    console.error("Error in message processing:", e);
+    console.error(e.stack);
+    return true;
+  }
+}
+
+async function main() {
+  try {
+    console.log("🤖: Hello! I'm your AI Todo Assistant. How can I help you today?");
+    
+    while (true) {
+      const query = readlineSync.question(">> ");
+      await processMessage(query);
+    }
+  } catch (error) {
+    console.error("Error in main:", error);
+    console.error(error.stack);
+  }
+}
+
+main().catch(console.error);
